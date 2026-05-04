@@ -1,6 +1,8 @@
 #include <iostream>
 #include <unistd.h>
 #include <dirent.h>
+#include <sys/stat.h>
+#include <cerrno>
 
 using namespace std;
 
@@ -27,6 +29,22 @@ int main(int argc, char* argv[]) {
         }
     }
     closedir(dir);
+
+
+    const char* pipePath = "/tmp/my_pipe";
+
+    // Attempt to create the named pipe
+    if (mkfifo(pipePath, 0666) == -1) {
+        if (errno == EEXIST) {
+            std::cout << "Pipe already exists, proceeding." << std::endl;
+        } else {
+            // Handle other potential errors (e.g., EACCES, ENOSPC)
+            std::cerr << "Failed to create pipe." << endl;
+            return 1;
+        }
+    } else {
+        std::cout << "Pipe created successfully." << std::endl;
+    }
 
 
 
