@@ -31,7 +31,7 @@ int main()
 
     pid_t pid3=fork();
 
-    if(pid1==0)
+    if(pid3==0)
     {
         cout<<"   REPORTER STARTED "<<endl;  
         execl("./build/reporter","reporter",NULL);
