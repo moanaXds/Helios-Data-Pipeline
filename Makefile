@@ -16,7 +16,7 @@ ingester:
 	$(CXX) $(CXXFLAGS) $(SRC_DIR)/ingester.cpp -o $(BUILD_DIR)/ingester
 
 processor:
-    $(CXX) $(CXXFLAGS) -pthread $(SRC_DIR)/processor.cpp -o $(BUILD_DIR)/processor
+	$(CXX) $(CXXFLAGS) -pthread $(SRC_DIR)/processor.cpp -o $(BUILD_DIR)/processor
 
 reporter:
 	$(CXX) $(CXXFLAGS) $(SRC_DIR)/reporter.cpp -o $(BUILD_DIR)/reporter
