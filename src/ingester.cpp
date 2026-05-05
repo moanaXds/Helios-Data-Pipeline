@@ -8,6 +8,12 @@
 #include <string.h>
 using namespace std;
 
+struct ChunkHeader {
+    int chunk_id;
+    int byte_count;
+    int source_file_id;
+};
+
 int main(int argc, char* argv[]) {
     cout << "[INGESTER PID: " << getpid() << endl;
     cout << "[INGESTER PPID: " << getppid() << endl;
@@ -61,16 +67,60 @@ int main(int argc, char* argv[]) {
     }
     else
     {
-        char buffer[1024];  // line buffer
+        char buffer[1024];
+        string chunk_buffer = "";
+        int chunk_size = 1000;
+        int chunk_id = 0;
 
-        for (const string& filepath : csv_file_names) {
+        for (int i = 0; i < csv_file_names.size(); i++) {
+            string& filepath = csv_file_names[i];
             FILE* file = fopen(filepath.c_str(), "r");
-            if (file == NULL) { /* handle error */ continue; }
             
-            while (fgets(buffer, sizeof(buffer), file) != NULL) {
-                write(fifo_write, buffer, strlen(buffer));
-                
+            if (file == NULL) {
+                cout << "Error opening file: " << filepath << endl;
+                continue;
             }
+
+            int line_count = 0;
+            while (fgets(buffer, sizeof(buffer), file) != NULL) {
+                chunk_buffer += buffer;
+                line_count++;
+
+                if (line_count == chunk_size) {
+                    ChunkHeader header;
+                    header.chunk_id = chunk_id++;
+                    header.source_file_id = i;
+                    header.byte_count = chunk_buffer.size();
+
+                    write(fifo_write, &header, sizeof(ChunkHeader));
+                    write(fifo_write, chunk_buffer.c_str(), chunk_buffer.size());
+
+                    cout << "[INGESTER] Sent chunk " << header.chunk_id 
+                        << " from file " << i 
+                        << " (" << header.byte_count << " bytes)" << endl;
+
+                    chunk_buffer = "";
+                    line_count = 0;
+                }
+            }
+
+            // send remaining lines that didn't fill a full chunk
+            if (!chunk_buffer.empty()) {
+                ChunkHeader header;
+                header.chunk_id = chunk_id++;
+                header.source_file_id = i;
+                header.byte_count = chunk_buffer.size();
+
+                write(fifo_write, &header, sizeof(ChunkHeader));
+                write(fifo_write, chunk_buffer.c_str(), chunk_buffer.size());
+
+                cout << "[INGESTER] Sent final chunk " << header.chunk_id 
+                    << " from file " << i 
+                    << " (" << header.byte_count << " bytes)" << endl;
+
+                chunk_buffer = "";
+            }
+
             fclose(file);
         }
     }
