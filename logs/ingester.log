@@ -1,0 +1,5 @@
+[INGESTER] PID:  3876
+[INGESTER] PPID: 3875
+[INGESTER] Found 3 CSV file(s) in './input'
+[INGESTER] FIFO '/tmp/clickstream_pipe' opened for writing.
+[INGESTER] Sent chunk 0 from file 0 (29401 bytes)

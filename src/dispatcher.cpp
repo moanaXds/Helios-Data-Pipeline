@@ -1,34 +1,31 @@
 // =============================================================================
-// dispatcher.cpp  –  Master process
+// dispatcher.cpp  –  Master orchestration process
 //
-// Usage: ./dispatcher <input_dir> <output_dir> <num_threads N> <queue_size Q>
+// Usage: ./dispatcher <input_dir> <output_dir> <num_threads> <queue_size>
 //
 // Responsibilities:
 //   1. Parse CLI args.
-//   2. Create FIFO and shared-memory segment.
+//   2. Create FIFO and shared-memory segment and named semaphore.
 //   3. Install signal handlers (SIGINT, SIGTERM, SIGCHLD, SIGUSR1).
-//   4. Fork + exec ingester, processor, reporter (each redirecting
-//      stdout/stderr to a per-process log file via dup2).
+//   4. Fork + exec ingester, processor, reporter, each with stdout/stderr
+//      redirected to a per-process log file via dup2().
 //   5. Block in sigsuspend() loop until all 3 children exit.
 //   6. On shutdown: forward SIGTERM to children, waitpid, cleanup IPC.
 //   7. Print final summary (PID, exit status, runtime) per child.
 // =============================================================================
 
-#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <semaphore.h>
-#include <csignal>
-#include <cerrno>
-#include <cstring>
-#include <cstdlib>
-#include <ctime>
-#include <string>
-
-using namespace std;
+#include <time.h>
 
 // IPC names – fixed so every component agrees
 #define FIFO_PATH   "/tmp/clickstream_pipe"
@@ -43,34 +40,60 @@ static pid_t g_pid_reporter  = -1;
 static volatile sig_atomic_t g_children_done = 0;
 static volatile sig_atomic_t g_shutdown      = 0;
 
-// ── Signal handlers ──────────────────────────────────────────────────────────
-
-static void handle_sigchld(int /*sig*/) {
-    // Reap any child that finished; avoid zombies
+// ---------------------------------------------------------------------------
+// Signal handlers
+// ---------------------------------------------------------------------------
+static void HANDLE_SIGCHLD(int sig) {
+    (void)sig;
     int status;
     while (waitpid(-1, &status, WNOHANG) > 0)
         ;
     g_children_done = 1;
 }
 
-static void handle_shutdown(int /*sig*/) {
+static void HANDLE_SHUTDOWN(int sig) {
+    (void)sig;
     g_shutdown = 1;
-    // Forward SIGTERM to children so they can clean up
     if (g_pid_ingester  > 0) kill(g_pid_ingester,  SIGTERM);
     if (g_pid_processor > 0) kill(g_pid_processor, SIGTERM);
     if (g_pid_reporter  > 0) kill(g_pid_reporter,  SIGTERM);
 }
 
-static void handle_sigusr1(int /*sig*/) {
-    // Dump live status to stderr
+static void HANDLE_SIGUSR1(int sig) {
+    (void)sig;
     fprintf(stderr,
             "[DISPATCHER] SIGUSR1: ingester=%d processor=%d reporter=%d\n",
-            (int)g_pid_ingester, (int)g_pid_processor, (int)g_pid_reporter);
+            (int)g_pid_ingester,
+            (int)g_pid_processor,
+            (int)g_pid_reporter);
 }
 
-// ── Helper: open a log file and dup2 stdout+stderr to it ────────────────────
-// Called inside the child BEFORE exec.
-static void redirect_logs(const char *path) {
+// ---------------------------------------------------------------------------
+// Install all signal handlers
+// ---------------------------------------------------------------------------
+static void INSTALL_HANDLER(void) {
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+
+    sa.sa_handler = HANDLE_SIGCHLD;
+    sa.sa_flags   = SA_RESTART | SA_NOCLDSTOP;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    sa.sa_handler = HANDLE_SHUTDOWN;
+    sa.sa_flags   = 0;
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    sa.sa_handler = HANDLE_SIGUSR1;
+    sa.sa_flags   = 0;
+    sigaction(SIGUSR1, &sa, NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Open a log file and redirect stdout + stderr into it.
+// Called inside the child process BEFORE exec().
+// ---------------------------------------------------------------------------
+static void REDIRECT_LOGS(const char *path) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) { perror("open log"); return; }
     dup2(fd, STDOUT_FILENO);
@@ -78,14 +101,17 @@ static void redirect_logs(const char *path) {
     close(fd);
 }
 
-// ── main ────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 int main(int argc, char *argv[]) {
-    cout << "[DISPATCHER] PID:  " << getpid()  << endl;
-    cout << "[DISPATCHER] PPID: " << getppid() << endl;
+    printf("[DISPATCHER] PID:  %d\n", getpid());
+    printf("[DISPATCHER] PPID: %d\n", getppid());
 
     if (argc != 5) {
-        cerr << "Usage: " << argv[0]
-             << " <input_dir> <output_dir> <num_threads> <queue_size>" << endl;
+        fprintf(stderr,
+                "Usage: %s <input_dir> <output_dir> <num_threads> <queue_size>\n",
+                argv[0]);
         return 10;
     }
 
@@ -94,84 +120,81 @@ int main(int argc, char *argv[]) {
     const char *n_threads  = argv[3];
     const char *q_size     = argv[4];
 
-    // ── Create logs directory ────────────────────────────────────────────
-    mkdir(LOGS_DIR, 0755);
-    mkdir(output_dir, 0755);
+    // ── Create directories ───────────────────────────────────────────────────
+    mkdir(LOGS_DIR,    0755);
+    mkdir(output_dir,  0755);
 
-    // ── Create FIFO ──────────────────────────────────────────────────────
-    unlink(FIFO_PATH);   // remove stale pipe if any
+    // ── Create FIFO ──────────────────────────────────────────────────────────
+    unlink(FIFO_PATH);
     if (mkfifo(FIFO_PATH, 0666) < 0) {
         perror("[DISPATCHER] mkfifo");
         return 20;
     }
-    cout << "[DISPATCHER] FIFO created: " << FIFO_PATH << endl;
+    printf("[DISPATCHER] FIFO created: %s\n", FIFO_PATH);
 
-    // ── Pre-create shared-memory segment (tiny placeholder; processor
-    //    will ftruncate to the real size after aggregation) ───────────────
+    // Open FIFO O_RDWR so it always has both ends open.
+    // This prevents ingester (writer) and processor (reader) from blocking
+    // on open() waiting for the other end to connect first.
+    int fifo_keeper = open(FIFO_PATH, O_RDWR);
+    if (fifo_keeper < 0) {
+        perror("[DISPATCHER] open FIFO keeper");
+        return 20;
+    }
+
+    // ── Create shared-memory segment (placeholder; processor resizes it) ─────
     shm_unlink(SHM_NAME);
     int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
     if (shm_fd < 0) { perror("[DISPATCHER] shm_open"); return 20; }
-    ftruncate(shm_fd, sizeof(int));   // placeholder – just 4 bytes
+    ftruncate(shm_fd, sizeof(int));
     close(shm_fd);
-    cout << "[DISPATCHER] Shared memory '" << SHM_NAME << "' created." << endl;
+    printf("[DISPATCHER] Shared memory '%s' created.\n", SHM_NAME);
 
-    // ── Pre-create named semaphore (init=0; processor will sem_post it) ──
+    // ── Create named semaphore (init=0; processor will sem_post it) ──────────
     sem_unlink(SEM_NAME);
     sem_t *done_sem = sem_open(SEM_NAME, O_CREAT | O_EXCL, 0666, 0);
     if (done_sem == SEM_FAILED) { perror("[DISPATCHER] sem_open"); return 20; }
     sem_close(done_sem);
-    cout << "[DISPATCHER] Named semaphore '" << SEM_NAME << "' created." << endl;
+    printf("[DISPATCHER] Semaphore '%s' created.\n", SEM_NAME);
 
-    // ── Install signal handlers ──────────────────────────────────────────
-    struct sigaction sa{};
-    sa.sa_handler = handle_sigchld;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    sigaction(SIGCHLD, &sa, nullptr);
+    // ── Install signal handlers ──────────────────────────────────────────────
+    INSTALL_HANDLER();
 
-    sa.sa_handler = handle_shutdown;
-    sigaction(SIGINT,  &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
-
-    sa.sa_handler = handle_sigusr1;
-    sigaction(SIGUSR1, &sa, nullptr);
-
-    // ── Record start times ───────────────────────────────────────────────
+    // ── Record start times ───────────────────────────────────────────────────
     time_t t_ingester_start, t_processor_start, t_reporter_start;
 
-    // ── Fork ingester ────────────────────────────────────────────────────
-    t_ingester_start = time(nullptr);
+    // ── Fork ingester ─────────────────────────────────────────────────────────
+    t_ingester_start = time(NULL);
     g_pid_ingester = fork();
     if (g_pid_ingester == 0) {
-        redirect_logs(LOGS_DIR "/ingester.log");
-        execl("./build/ingester", "ingester", input_dir, nullptr);
-        perror("execl ingester"); _exit(40);
+        execl("./build/ingester", "ingester", input_dir, NULL);
+        perror("execl ingester");
+        _exit(40);
     }
-    cout << "[DISPATCHER] Ingester  PID=" << g_pid_ingester << endl;
+    printf("[DISPATCHER] Ingester  PID=%d\n", (int)g_pid_ingester);
 
-    // ── Fork processor ───────────────────────────────────────────────────
-    t_processor_start = time(nullptr);
+    // ── Fork processor ────────────────────────────────────────────────────────
+    t_processor_start = time(NULL);
     g_pid_processor = fork();
     if (g_pid_processor == 0) {
-        redirect_logs(LOGS_DIR "/processor.log");
         execl("./build/processor", "processor",
-              FIFO_PATH, n_threads, q_size, SHM_NAME, SEM_NAME, nullptr);
-        perror("execl processor"); _exit(40);
+              FIFO_PATH, n_threads, q_size, SHM_NAME, SEM_NAME, NULL);
+        perror("execl processor");
+        _exit(40);
     }
-    cout << "[DISPATCHER] Processor PID=" << g_pid_processor << endl;
+    printf("[DISPATCHER] Processor PID=%d\n", (int)g_pid_processor);
 
-    // ── Fork reporter ────────────────────────────────────────────────────
-    t_reporter_start = time(nullptr);
+    // ── Fork reporter ─────────────────────────────────────────────────────────
+    t_reporter_start = time(NULL);
     g_pid_reporter = fork();
     if (g_pid_reporter == 0) {
-        redirect_logs(LOGS_DIR "/reporter.log");
         execl("./build/reporter", "reporter",
-              SHM_NAME, SEM_NAME, output_dir, nullptr);
-        perror("execl reporter"); _exit(40);
+              SHM_NAME, SEM_NAME, output_dir, NULL);
+        perror("execl reporter");
+        _exit(40);
     }
-    cout << "[DISPATCHER] Reporter  PID=" << g_pid_reporter << endl;
+    printf("[DISPATCHER] Reporter  PID=%d\n", (int)g_pid_reporter);
 
-    // ── Wait loop (sigsuspend – no busy-wait) ────────────────────────────
+    // ── Wait loop (sigsuspend – no busy-wait) ────────────────────────────────
     sigset_t wait_mask;
     sigfillset(&wait_mask);
     sigdelset(&wait_mask, SIGCHLD);
@@ -183,41 +206,41 @@ int main(int argc, char *argv[]) {
     while (remaining > 0 && !g_shutdown) {
         sigsuspend(&wait_mask);
 
-        // Reap any finished children
         int status;
         pid_t pid;
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-            time_t end = time(nullptr);
-            const char *name = "unknown";
-            time_t start = end;
+            time_t end   = time(NULL);
+            const char *name  = "unknown";
+            time_t      start = end;
+
             if (pid == g_pid_ingester)  { name = "ingester";  start = t_ingester_start; }
             if (pid == g_pid_processor) { name = "processor"; start = t_processor_start; }
             if (pid == g_pid_reporter)  { name = "reporter";  start = t_reporter_start; }
 
             int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-            cout << "[DISPATCHER] Child " << name
-                 << " PID=" << pid
-                 << " exited with status=" << exit_code
-                 << " runtime=" << (end - start) << "s" << endl;
+            printf("[DISPATCHER] Child %s PID=%d status=%d runtime=%lds\n",
+                   name, (int)pid, exit_code, (long)(end - start));
             remaining--;
         }
     }
 
-    // If we got a shutdown signal, forward SIGTERM and reap
+    // If we got a shutdown signal, reap remaining children
     if (g_shutdown) {
         if (g_pid_ingester  > 0) kill(g_pid_ingester,  SIGTERM);
         if (g_pid_processor > 0) kill(g_pid_processor, SIGTERM);
         if (g_pid_reporter  > 0) kill(g_pid_reporter,  SIGTERM);
-        waitpid(g_pid_ingester,  nullptr, 0);
-        waitpid(g_pid_processor, nullptr, 0);
-        waitpid(g_pid_reporter,  nullptr, 0);
+        waitpid(g_pid_ingester,  NULL, 0);
+        waitpid(g_pid_processor, NULL, 0);
+        waitpid(g_pid_reporter,  NULL, 0);
     }
 
-    // ── Cleanup IPC ──────────────────────────────────────────────────────
+    // ── Cleanup IPC ──────────────────────────────────────────────────────────
+    // Close keeper now – all children are done with the FIFO.
+    close(fifo_keeper);
     unlink(FIFO_PATH);
     shm_unlink(SHM_NAME);
     sem_unlink(SEM_NAME);
-    cout << "[DISPATCHER] IPC resources cleaned up." << endl;
-    cout << "[DISPATCHER] All processes finished. Exiting." << endl;
+    printf("[DISPATCHER] IPC resources cleaned up.\n");
+    printf("[DISPATCHER] All processes finished. Exiting.\n");
     return 0;
 }

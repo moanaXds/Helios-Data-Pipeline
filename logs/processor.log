@@ -1,0 +1,4 @@
+[PROCESSOR] sem_init empty: Function not implemented
+[PROCESSOR] PID:  3877
+[PROCESSOR] PPID: 3875
+[PROCESSOR] FIFO '/tmp/clickstream_pipe' opened.
